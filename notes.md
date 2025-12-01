@@ -1,54 +1,18 @@
-We need to cut either 2 or 4 squares
-- For 2, the corners must be adjacent
-- For 4, must include all corner cells
+Grokking
 
-There is a "base" shape with dimensions bounded by the inner corners
-of the cut shapes (4) or the inner corners + edge cells in the same 
-dimension and width as corners
+Applying number constraints:
+We iterate over r and c -- 0 row is top, 0 col is left: need to adjust my board setup accordingly
 
-Valid boxes must have:
-- A valid base
-- Pair of rectangles adjacent to the base that span to opposite edges must either 
-1. Have a combined to-edge width at least the width of base + 2 
--> In this case, the combined width can only be greater in increments of
-two cells
-2. Have the same to-edge width equal to (combined width of the other pair of rectangles - base width in that dimension) / 2
+Each Cell struct holds a CellContent (an alias for a std::variant object owned by the struct) initialized with an EmptyCell. We have bool helper functions to return whether the variant object holds each of the specific alternatives
+-> std::variant is just a class template that represents a type-safe union
+-> std::get_if<...>(variant ptr) returns nullptr if the pointer passed as an argument does not point to a type in the variant specified by the template argument
 
-^ Ok intuition, but we don't need to cut away only rectangles: it's any groupof orthogonal cells with at least one edge cell
+If the board notes have been updated, we return true, else false.
+s is a parameter holding the State reference, and s.board gives the std::array holding cell objects
+-> Must continue if not a number cell, because these are the only cells we are considering for this function.
 
-Six faces:
-Base - 1 
-North - 2 
-East - 3 
-South - 4 
-West - 5 
-Top - 6 
+When checking connectivity and holes, we use a visited set and a queue. All we have to do is choose a starting cell, add it to visited and queue, then while the queue is not empty, get the queue front Pos, pop from q, inc a visited counter, then for all orthogonal cells, continue if OOB, already in visited, or if not in box, then set the vis for position as true and push the Pos. If after doing this, the visited count is not the same as the entire yes count, we know the box we have isn't fully connected
 
-Can think of this as a graph: if we assign a cell to a face, different movements will either be part of the same face, or move to a different face:
-- Assume the base rectangle is static, but we can remove cells from it so long as we add them back from a cell that can reach it
-1: N -> 2, E -> 3, S -> 4, W -> 5
-2. N -> 2 | 6, E -> 2 (doesn't exceed base cell span E side) | 3 (does), S -> 1 | 2, W -> 2 (doesn't exceed base W span) | 5 (does)
-3. N -> 2 | 3,
-4. N -> 1 | 4,
-5. N -> 2 (exceeds base N span while connected to base) | 
+For holes, we use border cells of the bounding rectangle as potential start points, and explore similarly. If a cell is empty but isn't in the visited empty, we found a hole
 
-Holdon: think about this in terms of face pairs: think about an arrow on a face pointing away from an adjacent face, four potential per face, i.e. orientation
-- More intuitive: can either walk forward or turn, for simplicity assume we turn as if we are inside the box
-
-From the base, we can determine the bounds such that a walk forward in 4 directions will move to another face
-
-From a face adjacent to the base, walks forward may stay in the same face or move to another. The max amount of walks forward in a single face must be equal on opposite faces when extending from the base
-
-If the grid edge is reached and we still want to walk forward on the same face, look for alternative routes
-
-The numbers give us starting face cells: within one king-move distance (including the number cell)
-- We can logic our way through some: the 9 is a good starting point: if a number is maxed out, invalidate the remaining adjacent cells
-The arrows give non-viable cells
-- If two arrows point towards each other and leave one gap, the gap is a face cell
-- If a cell has a multi-arrow, the closest cells must have equal distance
-Grey squares (7) may be part of the same face group (and thus walkable to each other)
-- Squares are walkable to each other if a walk to the cell occupies the adjacent position: think about a cell "wrapping around" to reach the face vs. moving from one face to another
-Grey circles may be the same position on opposite face pairs
--> Best to mark these cells first, then fill in the gaps
--> We know we have three rectangle pairs with the same length and width, and number of cells
--> Three dimensional one-hot vector walks 
+So if either check constraints functions return true, we keep checking constraints. If both return false, check connectivity and holes must return true

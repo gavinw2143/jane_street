@@ -3,6 +3,9 @@
 #include <array>
 #include <vector>
 #include <queue>
+#include <variant>
+#include <initializer_list>
+#include <iostream>
 
 /*
  * Globals
@@ -33,6 +36,8 @@ enum class InBox : uint8_t {
     No,
     Yes
 };
+
+enum class ConstraintStatus { Ok, Contradiction };
 
 using ArrowMask = uint8_t;
 
@@ -122,15 +127,432 @@ struct State {
     Board board;
 };
 
-/*
-* Helpers
-*/
+
+enum class FaceId : uint8_t {
+    F0 = 0, F1, F2, F3, F4, F5
+};
+
+struct FaceAssignment {
+    bool assigned = false;
+    FaceId face{};
+    int u = 0;  // local coords on that face
+    int v = 0;
+};
+
+struct FaceInfo {
+    bool used = false;
+    int min_u = 0, max_u = -1;
+    int min_v = 0, max_v = -1;
+    int cell_count = 0;
+};
+
+inline bool face_used(uint8_t mask, FaceId f) {
+    return mask & (1u << face_index(f));
+}
+
+inline uint8_t mark_face_used(uint8_t mask, FaceId f) {
+    return mask | (1u << face_index(f));
+}
+
+struct FoldingState {
+    // For each board cell (r,c), what face / local coord is it on (if any)?
+    std::array<std::array<FaceAssignment, BoardSize>, BoardSize> assign{};
+
+    // Info about each face's occupied rectangle
+    std::array<FaceInfo, 6> faces{};
+};
+
+struct FoldSearchState {
+    FoldingState F;
+    std::queue<Pos> frontier;
+    int yes_total = 0;
+    uint8_t used_faces_mask = 0; // bit i set => FaceId::Fi used
+};
+
+inline int face_index(FaceId f) {
+    return static_cast<int>(f);
+}
+
+
+bool place_cell(FoldingState& F, int r, int c, FaceId face, int u, int v) {
+    FaceAssignment& cur = F.assign[r][c];
+    int fi = face_index(face);
+
+    // If already assigned, must be consistent
+    if (cur.assigned) {
+        if (cur.face != face || cur.u != u || cur.v != v) {
+            return false; // conflicting assignment
+        }
+        return true; // nothing new
+    }
+
+    // Check overlap: no other cell can already be at (face,u,v)
+    for (int rr = 0; rr < BoardSize; ++rr) {
+        for (int cc = 0; cc < BoardSize; ++cc) {
+            const FaceAssignment& fa = F.assign[rr][cc];
+            if (!fa.assigned) continue;
+            if (fa.face == face && fa.u == u && fa.v == v) {
+                // Another cell already occupies this local coord
+                return false;
+            }
+        }
+    }
+
+    // Assign
+    cur.assigned = true;
+    cur.face = face;
+    cur.u = u;
+    cur.v = v;
+
+    // Update face info
+    FaceInfo& info = F.faces[fi];
+    if (!info.used) {
+        info.used = true;
+        info.min_u = info.max_u = u;
+        info.min_v = info.max_v = v;
+        info.cell_count = 1;
+    } else {
+        if (u < info.min_u) info.min_u = u;
+        if (u > info.max_u) info.max_u = u;
+        if (v < info.min_v) info.min_v = v;
+        if (v > info.max_v) info.max_v = v;
+        info.cell_count += 1;
+    }
+
+    return true;
+}
+
 inline bool in_bounds(int r, int c) {
     return 0 <= r && r < BoardSize && 0 <= c && c < BoardSize;
 }
 
-bool apply_number_constraints(State& s) {
-    bool changed = false;
+bool embed_as_single_face(const State& s, FoldingState& F) {
+    F = FoldingState{};
+
+    static const int DR[4] = {-1, 0, 1, 0};
+    static const int DC[4] = { 0, 1, 0,-1};
+
+    int start_r = -1, start_c = -1;
+    int yes_count = 0;
+
+    for (int r = 0; r < BoardSize; ++r) {
+        for (int c = 0; c < BoardSize; ++c) {
+            if (s.board[r][c].in_box == InBox::Yes) {
+                if (start_r == -1) {
+                    start_r = r;
+                    start_c = c;
+                }
+                yes_count++;
+            }
+        }
+    }
+
+    if (yes_count == 0) return false;
+
+    std::array<std::array<bool, BoardSize>, BoardSize> seen{};
+    std::queue<Pos> q;
+
+    if (!place_cell(F, start_r, start_c, FaceId::F0, 0, 0)) {
+        return false;
+    }
+
+    seen[start_r][start_c] = true;
+    q.push({start_r, start_c});
+
+    int visited_yes = 0;
+
+    while (!q.empty()) {
+        Pos p = q.front();
+        q.pop();
+        visited_yes++;
+
+        const FaceAssignment& fa = F.assign[p.r][p.c];
+        FaceId face = fa.face;
+        int u = fa.u;
+        int v = fa.v;
+
+        for (int i = 0; i < 4; ++i) {
+            int rr = p.r + DR[i];
+            int cc = p.c + DC[i];
+            if (!in_bounds(rr, cc)) continue;
+            if (s.board[rr][cc].in_box != InBox::Yes) continue;
+            if (seen[rr][cc]) continue;
+
+            int uu = u + DC[i];
+            int vv = v + DR[i];
+
+            if (!place_cell(F, rr, cc, face, uu, vv)) {
+                return false;
+            }
+
+            seen[rr][cc] = true;
+            q.push({rr, cc});
+        }
+    }
+
+    if (visited_yes != yes_count) {
+        return false;
+    }
+
+    FaceInfo& info = F.faces[face_index(FaceId::F0)];
+    if (!info.used) return false;
+
+    int width  = info.max_u - info.min_u + 1;
+    int height = info.max_v - info.min_v + 1;
+
+    if (width * height != info.cell_count) {
+        return false;
+    }
+
+    return true;
+}
+
+
+bool check_neighbor_consistency(const FoldingState& F,
+                                const Pos& p, const Pos& q,
+                                int dr, int dc) {
+    const auto& ap = F.assign[p.r][p.c];
+    const auto& aq = F.assign[q.r][q.c];
+
+    if (!ap.assigned || !aq.assigned) return true; // nothing to check
+
+    if (ap.face == aq.face) {
+        int du = aq.u - ap.u;
+        int dv = aq.v - ap.v;
+
+        // board move (dr,dc): N=(-1,0),S=(1,0),E=(0,1),W=(0,-1)
+        // we map: u = x-like = column, v = y-like = row
+        // so dc → du, dr → dv
+        if (du == dc && dv == dr && std::abs(du) + std::abs(dv) == 1) {
+            return true; // consistent same-face adjacency
+        }
+        return false; // conflict
+    } else {
+        // Different faces: for now, don't enforce more.
+        return true;
+    }
+}
+
+
+static const int DR[4] = {-1, 0, 1, 0};
+static const int DC[4] = { 0, 1, 0,-1};
+
+bool final_face_shape_check(const FoldSearchState& S) {
+    // For now: just ensure each used face is a solid rectangle
+    for (int fi = 0; fi < 6; ++fi) {
+        const FaceInfo& info = S.F.faces[fi];
+        if (!info.used) continue;
+        int w = info.max_u - info.min_u + 1;
+        int h = info.max_v - info.min_v + 1;
+        if (w * h != info.cell_count) return false;
+    }
+    // Later: add (A,B,C) side-length compatibility and cube-graph checks
+    return true;
+}
+
+bool all_yes_assigned(const State& s, const FoldingState& F, int yes_total) {
+    int count = 0;
+    for (int r = 0; r < BoardSize; ++r)
+        for (int c = 0; c < BoardSize; ++c)
+            if (s.board[r][c].in_box == InBox::Yes && F.assign[r][c].assigned)
+                ++count;
+    return count == yes_total;
+}
+
+bool search_fold(const State& s, FoldSearchState state) {
+    // If no more frontier cells to expand, we are done embedding adjacency
+    if (state.frontier.empty()) {
+        // All reachable YES cells are now assigned.
+        if (!all_yes_assigned(s, state.F, state.yes_total)) {
+            return false;
+        }
+        return final_face_shape_check(state);
+    }
+
+    // Pop one cell to process its neighbors
+    Pos p = state.frontier.front();
+    state.frontier.pop();
+
+    const auto& ap = state.F.assign[p.r][p.c];
+    FaceId face_p = ap.face;
+    int u_p = ap.u;
+    int v_p = ap.v;
+
+    // Explore all neighbors of p
+    for (int dir = 0; dir < 4; ++dir) {
+        int rr = p.r + DR[dir];
+        int cc = p.c + DC[dir];
+        if (!in_bounds(rr, cc)) continue;
+        if (s.board[rr][cc].in_box != InBox::Yes) continue;
+
+        Pos q{rr, cc};
+
+        const auto& aq = state.F.assign[rr][cc];
+
+        // 1. If neighbor already assigned, just check consistency
+        if (aq.assigned) {
+            if (!check_neighbor_consistency(state.F, p, q, DR[dir], DC[dir])) {
+                return false;
+            }
+            continue;
+        }
+
+        // 2. Neighbor not assigned yet → we branch
+
+        // --- Branch A: put q on the SAME face as p ---
+        {
+            FoldSearchState branch = state; // copy
+            int u_q = u_p + DC[dir];
+            int v_q = v_p + DR[dir];
+
+            if (place_cell(branch.F, rr, cc, face_p, u_q, v_q)) {
+                branch.frontier.push(q);
+                if (search_fold(s, std::move(branch))) {
+                    return true;
+                }
+            }
+        }
+
+        // --- Branch B: put q on a NEW face (if any free) ---
+        for (int fi = 0; fi < 6; ++fi) {
+            FaceId f = static_cast<FaceId>(fi);
+            if (face_used(state.used_faces_mask, f)) continue;
+            // Don't "move" it to the same face, we already tried that
+            if (f == face_p) continue;
+
+            FoldSearchState branch = state; // copy
+            branch.used_faces_mask = mark_face_used(branch.used_faces_mask, f);
+
+            // On new face, start q at (0,0) in local coords
+            if (place_cell(branch.F, rr, cc, f, 0, 0)) {
+                branch.frontier.push(q);
+                if (search_fold(s, std::move(branch))) {
+                    return true;
+                }
+            }
+        }
+
+        // If no branch returned true for this neighbor, we continue the loop.
+        // Important: we *don't* immediately return false; another neighbor
+        // or another path might still succeed.
+    }
+
+    // After processing all neighbors of p, continue with remaining frontier
+    return search_fold(s, std::move(state));
+}
+
+
+bool fold_polyomino_into_faces(const State& s, FoldingState& out_solution) {
+    int yes_total = 0;
+    Pos start{-1, -1};
+
+    for (int r = 0; r < BoardSize; ++r) {
+        for (int c = 0; c < BoardSize; ++c) {
+            if (s.board[r][c].in_box == InBox::Yes) {
+                yes_total++;
+                if (start.r == -1) {
+                    start = {r, c};
+                }
+            }
+        }
+    }
+
+    if (yes_total == 0) return false;
+
+    FoldSearchState init;
+    init.yes_total = yes_total;
+    init.used_faces_mask = 0;
+
+    // Place the starting cell on face F0 at (0,0)
+    if (!place_cell(init.F, start.r, start.c, FaceId::F0, 0, 0)) {
+        return false;
+    }
+    init.used_faces_mask = mark_face_used(init.used_faces_mask, FaceId::F0);
+    init.frontier.push(start);
+
+    if (search_fold(s, init)) {
+        out_solution = std::move(init.F);
+        return true;
+    }
+
+    return false;
+}
+
+/*
+* Helpers
+*/
+std::string cell_to_string(const Cell& cell) {
+    // 1) Arrow cells: ^ > v < for NESW, possibly in combination
+    if (cell.is_arrow()) {
+        const ArrowCell* ac = cell.as_arrow();
+        ArrowMask mask = ac->arrows;
+        std::string s;
+
+        auto has_dir = [&](Direction d) {
+            return (mask >> static_cast<int>(d)) & 1u;
+        };
+
+        if (has_dir(Direction::North)) s.push_back('^');
+        if (has_dir(Direction::East))  s.push_back('>');
+        if (has_dir(Direction::South)) s.push_back('v');
+        if (has_dir(Direction::West))  s.push_back('<');
+
+        if (s.empty()) s = " "; // shouldn't happen, but just in case
+        return s;
+    }
+
+    // 2) Number cells: (4), [4], or 4
+    if (cell.is_number()) {
+        const NumberCell* nc = cell.as_number();
+        char d = static_cast<char>('0' + nc->value);
+        switch (nc->enclosure) {
+            case Enclosure::Circle:
+                return std::string{"("} + d + ")";
+            case Enclosure::Square:
+                return std::string{"["} + d + "]";
+            case Enclosure::None:
+            default:
+                return std::string(1, d);
+        }
+    }
+
+    // 3) Empty cells: just blank
+    return " ";
+}
+
+std::string pad_center(const std::string& s, int width) {
+    if (static_cast<int>(s.size()) >= width) {
+        return s.substr(0, width);
+    }
+
+    int total = width - static_cast<int>(s.size());
+    int left  = total / 2;
+    int right = total - left;
+
+    return std::string(left, ' ') + s + std::string(right, ' ');
+}
+
+void print_board(const State& s, std::ostream& os = std::cout) {
+    constexpr int CELL_WIDTH = 5; // interior width between '|' and next '|'
+
+    for (int r = 0; r < BoardSize; ++r) {
+        for (int c = 0; c < BoardSize; ++c) {
+            const Cell& cell = s.board[r][c];
+            std::string txt = cell_to_string(cell);
+
+            std::string centered = pad_center(txt, CELL_WIDTH);
+            os << '|' << centered;
+        }
+        os << "|\n";
+	for (int c = 0; c < BoardSize; ++c) {
+	    os << "------";
+	}
+	os << "-\n";
+    }
+}
+
+ConstraintStatus apply_number_constraints(State& s, bool& changed) {
+    changed = false;
 
     for (int r = 0; r < BoardSize; ++r) {
         for (int c = 0; c < BoardSize; ++c) {
@@ -162,8 +584,8 @@ bool apply_number_constraints(State& s) {
                 }
             }
 
-            if (fixed_yes > n) return false;
-            if (fixed_yes + unknown < n) return false;
+            if (fixed_yes > n) return ConstraintStatus::Contradiction;
+            if (fixed_yes + unknown < n) return ConstraintStatus::Contradiction;
 
             if (fixed_yes == n) {
                 for (auto p : unknown_cells) {
@@ -185,7 +607,7 @@ bool apply_number_constraints(State& s) {
         }
     }
 
-    return changed;
+    return ConstraintStatus::Ok;
 }
 
 bool check_arrow_integrity(const State& s, int r, int c, ArrowMask mask, uint8_t dist) {
@@ -226,8 +648,8 @@ bool check_arrow_integrity(const State& s, int r, int c, ArrowMask mask, uint8_t
     return true;
 }
 
-bool apply_arrow_constraints(State& s) {
-    bool changed = false;
+ConstraintStatus apply_arrow_constraints(State& s, bool& changed) {
+    changed = false;
 
     for (int r = 0; r < BoardSize; ++r) {
         for (int c = 0; c < BoardSize; ++c) {
@@ -245,7 +667,7 @@ bool apply_arrow_constraints(State& s) {
             uint8_t arrows_distance = arrow_cell->arrows_distance;
 
             bool no_rogue = check_arrow_integrity(s, r, c, mask, arrows_distance);
-            if (!no_rogue) return false;
+            if (!no_rogue) return ConstraintStatus::Contradiction;
 
             int rr;
             int cc;
@@ -299,7 +721,7 @@ bool apply_arrow_constraints(State& s) {
                 if (!in_bounds(rr, cc)) continue;
                 Cell& nb = s.board[rr][cc];
 
-                if (nb.in_box == InBox::Yes) return false;
+                if (nb.in_box == InBox::Yes) return ConstraintStatus::Contradiction;
 
                 if (nb.in_box == InBox::Unknown) {
                     nb.in_box = InBox::No;
@@ -311,7 +733,7 @@ bool apply_arrow_constraints(State& s) {
         }
     }
 
-    return changed;
+    return ConstraintStatus::Ok;
 }
 
 bool check_connectivity_and_holes(const State& s) {
@@ -327,6 +749,7 @@ bool check_connectivity_and_holes(const State& s) {
     int min_c = BoardSize; 
     int max_c = -1;
 
+    // Get bounding rect
     for (int r = 0; r < BoardSize; ++r) {
         for (int c = 0; c < BoardSize; ++c) {
             if (s.board[r][c].in_box == InBox::Yes) {
@@ -422,118 +845,184 @@ bool check_connectivity_and_holes(const State& s) {
     return true;
 }
 
+bool propagate(State& s) {
+    bool any_changed = false;
+
+    while (true) {
+        bool changed_this_round = false;
+
+        bool changed_num = false;
+        if (apply_number_constraints(s, changed_num) == ConstraintStatus::Contradiction)
+            return false;
+
+        bool changed_arrow = false;
+        if (apply_arrow_constraints(s, changed_arrow) == ConstraintStatus::Contradiction)
+            return false;
+
+        changed_this_round = changed_num || changed_arrow;
+
+        if (!changed_this_round) break;
+        any_changed = true;
+    }
+
+    return true; // consistent after propagation
+}
+
+bool solve(State& s) {
+    // 1. Propagate constraints
+    if (!propagate(s)) return false;  // contradiction
+
+    // 2. If fully decided
+    //!has_unknown_cells(s)
+    if (false) {
+        // if (!check_connectivity_and_holes(s)) return false;
+        // if (!final_exact_arrow_check(s)) return false;
+        // later: foldability check
+        // success!
+        return true;
+    }
+
+    // 3. Choose an Unknown cell to branch on
+    // Pos p = pick_unknown_cell(s);  // heuristic of your choice
+
+    // Try Yes
+    //{
+    //    State s_yes = s;
+    //    s_yes.board[p.r][p.c].in_box = InBox::Yes;
+    //    if (solve(s_yes)) {
+    //        s = std::move(s_yes); // keep solution if you want
+    //        return true;
+    //    }
+    //}
+
+    // Try No
+    //{
+    //    State s_no = s;
+    //    s_no.board[p.r][p.c].in_box = InBox::No;
+    //    if (solve(s_no)) {
+    //        s = std::move(s_no);
+    //        return true;
+    //    }
+    //}
+
+    // Neither branch worked
+    return false;
+}
 
 int main() {
     Board board{};
 
     // Setting up board
-    at(board, 0, 0) = Cell::make_arrow({Direction::East});
-    at(board, 0, 4) = Cell::make_arrow({Direction::North, Direction::East});
-    at(board, 0, 7) = Cell::make_arrow({Direction::East});
-    at(board, 0, 11) = Cell::make_arrow({Direction::West});
-    at(board, 0, 18) = Cell::make_arrow({Direction::North, Direction::West});
+    at(board, 19, 0) = Cell::make_arrow({Direction::East});
+    at(board, 19, 4) = Cell::make_arrow({Direction::North, Direction::East});
+    at(board, 19, 7) = Cell::make_arrow({Direction::East});
+    at(board, 19, 11) = Cell::make_arrow({Direction::West});
+    at(board, 19, 18) = Cell::make_arrow({Direction::North, Direction::West});
 
-    at(board, 1, 4) = Cell::make_arrow({Direction::North, Direction::East});
-    at(board, 1, 6) = Cell::make_arrow({Direction::East});
-    at(board, 1, 8) = Cell::make_number(4, Enclosure::Square);
-    at(board, 1, 14) = Cell::make_arrow({Direction::North, Direction::West});
+    at(board, 18, 4) = Cell::make_arrow({Direction::North, Direction::East});
+    at(board, 18, 6) = Cell::make_arrow({Direction::East});
+    at(board, 18, 8) = Cell::make_number(4, Enclosure::Square);
+    at(board, 18, 14) = Cell::make_arrow({Direction::North, Direction::West});
 
-    at(board, 2, 1) = Cell::make_arrow({Direction::East});
-    at(board, 2, 10) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
-    at(board, 2, 12) = Cell::make_number(5, Enclosure::Circle);
-    at(board, 2, 13) = Cell::make_number(5);
+    at(board, 17, 1) = Cell::make_arrow({Direction::East});
+    at(board, 17, 10) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
+    at(board, 17, 12) = Cell::make_number(5, Enclosure::Circle);
+    at(board, 17, 13) = Cell::make_number(5);
 
-    at(board, 3, 5) = Cell::make_arrow({Direction::North});
-    at(board, 3, 7) = Cell::make_arrow({Direction::North, Direction::East});
-    at(board, 3, 16) = Cell::make_arrow({Direction::West});
-    at(board, 3, 18) = Cell::make_arrow({Direction::North, Direction::West});
+    at(board, 16, 5) = Cell::make_arrow({Direction::North});
+    at(board, 16, 7) = Cell::make_arrow({Direction::North, Direction::East});
+    at(board, 16, 16) = Cell::make_arrow({Direction::West});
+    at(board, 16, 18) = Cell::make_arrow({Direction::North, Direction::West});
 
-    at(board, 4, 2) = Cell::make_arrow({Direction::North, Direction::East});
-    at(board, 4, 4) = Cell::make_arrow({Direction::North});
-    at(board, 4, 6) = Cell::make_number(5);
-    at(board, 4, 9) = Cell::make_arrow({Direction::South, Direction::West});
-    at(board, 4, 14) = Cell::make_arrow({Direction::South, Direction::West});
-    at(board, 4, 19) = Cell::make_arrow({Direction::West});
+    at(board, 15, 2) = Cell::make_arrow({Direction::North, Direction::East});
+    at(board, 15, 4) = Cell::make_arrow({Direction::North});
+    at(board, 15, 6) = Cell::make_number(5);
+    at(board, 15, 9) = Cell::make_arrow({Direction::South, Direction::West});
+    at(board, 15, 14) = Cell::make_arrow({Direction::South, Direction::West});
+    at(board, 15, 19) = Cell::make_arrow({Direction::West});
 
-    at(board, 5, 8) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
-    at(board, 5, 11) = Cell::make_arrow({Direction::North, Direction::South});
-    at(board, 5, 13) = Cell::make_arrow({Direction::South});
+    at(board, 14, 8) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
+    at(board, 14, 11) = Cell::make_arrow({Direction::North, Direction::South});
+    at(board, 14, 13) = Cell::make_arrow({Direction::South});
 
-    at(board, 6, 0) = Cell::make_arrow({Direction::East});
-    at(board, 6, 3) = Cell::make_number(5, Enclosure::Square);
-    at(board, 6, 6) = Cell::make_number(6);
-    at(board, 6, 9) = Cell::make_number(2);
-    at(board, 6, 12) = Cell::make_arrow({Direction::North, Direction::West});
-    at(board, 6, 16) = Cell::make_arrow({Direction::North});
+    at(board, 13, 0) = Cell::make_arrow({Direction::East});
+    at(board, 13, 3) = Cell::make_number(5, Enclosure::Square);
+    at(board, 13, 6) = Cell::make_number(6);
+    at(board, 13, 9) = Cell::make_number(2);
+    at(board, 13, 12) = Cell::make_arrow({Direction::North, Direction::West});
+    at(board, 13, 16) = Cell::make_arrow({Direction::North});
 
-    at(board, 7, 2) = Cell::make_arrow({Direction::North, Direction::East});
-    at(board, 7, 5) = Cell::make_arrow({Direction::North, Direction::East, Direction::South, Direction::West});
-    at(board, 7, 18) = Cell::make_arrow({Direction::North});
+    at(board, 12, 2) = Cell::make_arrow({Direction::North, Direction::East});
+    at(board, 12, 5) = Cell::make_arrow({Direction::North, Direction::East, Direction::South, Direction::West});
+    at(board, 12, 18) = Cell::make_arrow({Direction::North});
 
-    at(board, 8, 8) = Cell::make_arrow({Direction::North, Direction::East, Direction::West});
-    at(board, 8, 10) = Cell::make_arrow({Direction::East, Direction::West});
-    at(board, 8, 14) = Cell::make_arrow({Direction::North, Direction::East, Direction::West});
-    at(board, 8, 17) = Cell::make_arrow({Direction::North, Direction::West});
+    at(board, 11, 8) = Cell::make_arrow({Direction::North, Direction::East, Direction::West});
+    at(board, 11, 10) = Cell::make_arrow({Direction::East, Direction::West});
+    at(board, 11, 14) = Cell::make_arrow({Direction::North, Direction::East, Direction::West});
+    at(board, 11, 17) = Cell::make_arrow({Direction::North, Direction::West});
 
-    at(board, 9, 1) = Cell::make_arrow({Direction::North});
-    at(board, 9, 3) = Cell::make_arrow({Direction::North, Direction::South});
-    at(board, 9, 5) = Cell::make_number(4);
-    at(board, 9, 7) = Cell::make_number(7);
-    at(board, 9, 18) = Cell::make_number(3, Enclosure::Square);
+    at(board, 10, 1) = Cell::make_arrow({Direction::North});
+    at(board, 10, 3) = Cell::make_arrow({Direction::North, Direction::South});
+    at(board, 10, 5) = Cell::make_number(4);
+    at(board, 10, 7) = Cell::make_number(7);
+    at(board, 10, 18) = Cell::make_number(3, Enclosure::Square);
 
-    at(board, 10, 1) = Cell::make_arrow({Direction::North, Direction::East});
-    at(board, 10, 12) = Cell::make_arrow({Direction::North, Direction::East, Direction::West});
-    at(board, 10, 14) = Cell::make_number(5);
-    at(board, 10, 16) = Cell::make_arrow({Direction::East, Direction::South});
-    at(board, 10, 18) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
+    at(board, 9, 1) = Cell::make_arrow({Direction::North, Direction::East});
+    at(board, 9, 12) = Cell::make_arrow({Direction::North, Direction::East, Direction::West});
+    at(board, 9, 14) = Cell::make_number(5);
+    at(board, 9, 16) = Cell::make_arrow({Direction::East, Direction::South});
+    at(board, 9, 18) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
 
-    at(board, 11, 2) = Cell::make_number(7, Enclosure::Circle);
-    at(board, 11, 5) = Cell::make_arrow({Direction::North, Direction::East, Direction::South});
-    at(board, 11, 9) = Cell::make_arrow({Direction::North, Direction::East, Direction::South, Direction::West});
-    at(board, 11, 11) = Cell::make_number(5, Enclosure::Square);
+    at(board, 8, 2) = Cell::make_number(7, Enclosure::Circle);
+    at(board, 8, 5) = Cell::make_arrow({Direction::North, Direction::East, Direction::South});
+    at(board, 8, 9) = Cell::make_arrow({Direction::North, Direction::East, Direction::South, Direction::West});
+    at(board, 8, 11) = Cell::make_number(5, Enclosure::Square);
 
-    at(board, 12, 1) = Cell::make_arrow({Direction::East, Direction::South});
-    at(board, 12, 14) = Cell::make_arrow({Direction::South, Direction::West});
-    at(board, 12, 17) = Cell::make_number(6, Enclosure::Square);
+    at(board, 7, 1) = Cell::make_arrow({Direction::East, Direction::South});
+    at(board, 7, 14) = Cell::make_arrow({Direction::South, Direction::West});
+    at(board, 7, 17) = Cell::make_number(6, Enclosure::Square);
 
-    at(board, 13, 3) = Cell::make_arrow({Direction::South});
-    at(board, 13, 7) = Cell::make_number(9);
-    at(board, 13, 10) = Cell::make_arrow({Direction::East, Direction::West});
-    at(board, 13, 13) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
-    at(board, 13, 16) = Cell::make_arrow({Direction::East});
-    at(board, 13, 19) = Cell::make_arrow({Direction::South, Direction::West});
+    at(board, 6, 3) = Cell::make_arrow({Direction::South});
+    at(board, 6, 7) = Cell::make_number(9);
+    at(board, 6, 10) = Cell::make_arrow({Direction::East, Direction::West});
+    at(board, 6, 13) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
+    at(board, 6, 16) = Cell::make_arrow({Direction::East});
+    at(board, 6, 19) = Cell::make_arrow({Direction::South, Direction::West});
 
-    at(board, 14, 6) = Cell::make_number(4);
-    at(board, 14, 8) = Cell::make_number(7, Enclosure::Square);
-    at(board, 14, 11) = Cell::make_arrow({Direction::East, Direction::South});
+    at(board, 5, 6) = Cell::make_number(4);
+    at(board, 5, 8) = Cell::make_number(7, Enclosure::Square);
+    at(board, 5, 11) = Cell::make_arrow({Direction::East, Direction::South});
 
-    at(board, 15, 0) = Cell::make_arrow({Direction::East});
-    at(board, 15, 5) = Cell::make_arrow({Direction::East, Direction::South});
-    at(board, 15, 10) = Cell::make_number(4, Enclosure::Circle);
-    at(board, 15, 13) = Cell::make_number(7);
-    at(board, 15, 15) = Cell::make_arrow({Direction::North, Direction::East, Direction::West});
-    at(board, 15, 17) = Cell::make_number(4, Enclosure::Circle);
+    at(board, 4, 0) = Cell::make_arrow({Direction::East});
+    at(board, 4, 5) = Cell::make_arrow({Direction::East, Direction::South});
+    at(board, 4, 10) = Cell::make_number(4, Enclosure::Circle);
+    at(board, 4, 13) = Cell::make_number(7);
+    at(board, 4, 15) = Cell::make_arrow({Direction::North, Direction::East, Direction::West});
+    at(board, 4, 17) = Cell::make_number(4, Enclosure::Circle);
 
-    at(board, 16, 1) = Cell::make_arrow({Direction::South});
-    at(board, 16, 3) = Cell::make_arrow({Direction::East, Direction::South});
-    at(board, 16, 12) = Cell::make_number(7);
-    at(board, 16, 14) = Cell::make_number(5, Enclosure::Circle);
+    at(board, 3, 1) = Cell::make_arrow({Direction::South});
+    at(board, 3, 3) = Cell::make_arrow({Direction::East, Direction::South});
+    at(board, 3, 12) = Cell::make_number(7);
+    at(board, 3, 14) = Cell::make_number(5, Enclosure::Circle);
 
-    at(board, 17, 6) = Cell::make_arrow({Direction::East});
-    at(board, 17, 7) = Cell::make_number(5, Enclosure::Square);
-    at(board, 17, 9) = Cell::make_arrow({Direction::East, Direction::South, Direction::West});
-    at(board, 17, 18) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
+    at(board, 2, 6) = Cell::make_arrow({Direction::East});
+    at(board, 2, 7) = Cell::make_number(5, Enclosure::Square);
+    at(board, 2, 9) = Cell::make_arrow({Direction::East, Direction::South, Direction::West});
+    at(board, 2, 18) = Cell::make_arrow({Direction::North, Direction::South, Direction::West});
 
-    at(board, 18, 4) = Cell::make_arrow({Direction::East});
-    at(board, 18, 11) = Cell::make_number(4);
-    at(board, 18, 13) = Cell::make_arrow({Direction::East, Direction::South, Direction::West});
-    at(board, 18, 15) = Cell::make_number(4, Enclosure::Circle);
+    at(board, 1, 4) = Cell::make_arrow({Direction::East});
+    at(board, 1, 11) = Cell::make_number(4);
+    at(board, 1, 13) = Cell::make_arrow({Direction::East, Direction::South, Direction::West});
+    at(board, 1, 15) = Cell::make_number(4, Enclosure::Circle);
 
-    at(board, 19, 1) = Cell::make_arrow({Direction::East});
-    at(board, 19, 8) = Cell::make_arrow({Direction::South, Direction::West});
-    at(board, 19, 12) = Cell::make_arrow({Direction::South});
-    at(board, 19, 15) = Cell::make_arrow({Direction::South});
-    at(board, 19, 19) = Cell::make_arrow({Direction::South, Direction::West});
+    at(board, 0, 1) = Cell::make_arrow({Direction::East});
+    at(board, 0, 8) = Cell::make_arrow({Direction::South, Direction::West});
+    at(board, 0, 12) = Cell::make_arrow({Direction::South});
+    at(board, 0, 15) = Cell::make_arrow({Direction::South});
+    at(board, 0, 19) = Cell::make_arrow({Direction::South, Direction::West});
+
+    State board_state{board};
+    print_board(board_state);
 }
 
 // Objective: Iterate through board cells, solving the validity of each using rules. Once the board has no unknown cells, we must assign each valid cell to one of 6 faces, where traversing forward will either move to another face ("fold", depends on orientation & current face) or stay on the same face
